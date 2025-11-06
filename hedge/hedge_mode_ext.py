@@ -508,6 +508,7 @@ class HedgeBot:
             if not api_key_private_key:
                 raise Exception("API_KEY_PRIVATE_KEY environment variable not set")
 
+            self.logger.info("Lighter client create")
             self.lighter_client = SignerClient(
                 url=self.lighter_base_url,
                 private_key=api_key_private_key,
@@ -516,6 +517,7 @@ class HedgeBot:
             )
 
             # Check client
+            self.logger.info("Lighter client check")
             err = self.lighter_client.check_client()
             if err is not None:
                 raise Exception(f"CheckClient error: {err}")
@@ -1038,7 +1040,9 @@ class HedgeBot:
 
         # Initialize clients
         try:
+            self.logger.info(f"lighter init")
             self.initialize_lighter_client()
+            self.logger.info(f"extended init")
             self.initialize_extended_client()
 
             # Get contract info
