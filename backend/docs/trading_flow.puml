@@ -1,0 +1,43 @@
+@startuml
+title TradingBot 执行流程
+skinparam activity {
+  BackgroundColor #f6f9fc
+  BorderColor #4a6fa5
+  FontSize 12
+}
+
+start
+:runbot.py 读取 CLI 参数;
+:加载 .env 并构造 TradingConfig;
+:ExchangeFactory.create_exchange();
+:TradingBot 初始化并注册订单回调;
+:exchange_client.connect();
+
+repeat
+  :获取活跃订单与账户仓位;
+  :_log_status_periodically 记录日志并检查仓位差;
+  if (触发停机/暂停?) then (是)
+    :发送通知;
+    :graceful_shutdown();
+    break
+  else (否)
+    if (冷却或网格条件未满足?) then (是)
+      :sleep 等待;
+    else (否)
+      :_place_and_monitor_open_order();
+      if (订单成交?) then (是)
+        if (Boost 模式?) then (是)
+          :place_market_order 对冲平仓;
+        else (否)
+          :计算止盈价并 place_close_order;
+        endif
+      else (否)
+        :根据价格变化撤单重挂;
+      endif
+    endif
+  endif
+repeat while (未请求停机)
+
+:exchange_client.disconnect();
+stop
+@enduml
