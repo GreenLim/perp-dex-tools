@@ -115,10 +115,11 @@ def run_command_background(command: list, task_id: str) -> ProcessInfo:
         env['TASK_ID'] = task_id
 
         # Start the process
+        # Don't capture stdout/stderr so logs go to Docker logs
         process = subprocess.Popen(
             command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=None,  # Inherit from parent (Docker)
+            stderr=None,  # Inherit from parent (Docker)
             env=env
         )
 

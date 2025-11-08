@@ -1,14 +1,12 @@
 import asyncio
 import json
 import signal
-import logging
 import os
 import sys
 import time
 import requests
 import argparse
 import traceback
-import csv
 from decimal import Decimal
 from typing import Tuple
 
@@ -20,19 +18,9 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from exchanges.extended import ExtendedClient
 import websockets
 from datetime import datetime, timezone, timedelta
-import pytz
 
-
-# Custom formatter to use UTC+8 timezone
-class UTC8Formatter(logging.Formatter):
-    """Formatter that converts timestamps to UTC+8"""
-    def formatTime(self, record, datefmt=None):
-        # Convert the timestamp to UTC+8
-        dt = datetime.fromtimestamp(record.created, tz=timezone(timedelta(hours=8)))
-        if datefmt:
-            return dt.strftime(datefmt)
-        else:
-            return dt.strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]  # Same format as default, with milliseconds
+# Import the unified hedge logger
+from helpers.logger import HedgeLogger
 
 
 class Config:
@@ -59,48 +47,11 @@ class HedgeBot:
         self.current_iteration = 0
         self.start_time = datetime.now()
 
-        # Initialize logging to file
-        os.makedirs("logs", exist_ok=True)
-        self.log_filename = f"logs/extended_{ticker}_hedge_mode_log.txt"
-        self.csv_filename = f"logs/extended_{ticker}_hedge_mode_trades.csv"
-        self.original_stdout = sys.stdout
-
-        # Initialize CSV file with headers if it doesn't exist
-        self._initialize_csv_file()
-
-        # Setup logger
-        self.logger = logging.getLogger(f"hedge_bot_{ticker}")
-        self.logger.setLevel(logging.INFO)
-
-        # Clear any existing handlers to avoid duplicates
-        self.logger.handlers.clear()
-
-        # Disable verbose logging from external libraries
-        logging.getLogger('urllib3').setLevel(logging.WARNING)
-        logging.getLogger('requests').setLevel(logging.WARNING)
-        logging.getLogger('websockets').setLevel(logging.WARNING)
-
-        # Create file handler
-        file_handler = logging.FileHandler(self.log_filename)
-        file_handler.setLevel(logging.INFO)
-
-        # Create console handler
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(logging.INFO)
-
-        # Create different formatters for file and console (using UTC+8 timezone)
-        file_formatter = UTC8Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        console_formatter = logging.Formatter('%(levelname)s:%(name)s:%(message)s')
-
-        file_handler.setFormatter(file_formatter)
-        console_handler.setFormatter(console_formatter)
-
-        # Add handlers to logger
-        self.logger.addHandler(file_handler)
-        self.logger.addHandler(console_handler)
-
-        # Prevent propagation to root logger to avoid duplicate messages
-        self.logger.propagate = False
+        # Initialize unified hedge logger
+        self.hedge_logger = HedgeLogger(exchange="extended", ticker=ticker)
+        self.logger = self.hedge_logger.logger  # For backward compatibility
+        self.log_filename = self.hedge_logger.log_filename
+        self.csv_filename = self.hedge_logger.csv_filename
 
         # State management
         self.stop_flag = False
@@ -186,20 +137,12 @@ class HedgeBot:
             except Exception as e:
                 self.logger.error(f"Error cancelling Lighter WebSocket task: {e}")
 
-        # Close logging handlers properly
-        for handler in self.logger.handlers[:]:
-            try:
-                handler.close()
-                self.logger.removeHandler(handler)
-            except Exception:
-                pass
+        # Note: Logger will be shutdown in async_shutdown called from run()
 
-    def _initialize_csv_file(self):
-        """Initialize CSV file with headers if it doesn't exist."""
-        if not os.path.exists(self.csv_filename):
-            with open(self.csv_filename, 'w', newline='') as csvfile:
-                writer = csv.writer(csvfile)
-                writer.writerow(['exchange', 'timestamp', 'side', 'price', 'quantity'])
+    async def async_shutdown(self):
+        """Async shutdown for logger only."""
+        if hasattr(self, 'hedge_logger'):
+            await self.hedge_logger.shutdown()
 
     def update_status(self):
         """Update shared status file with current bot state."""
@@ -239,19 +182,13 @@ class HedgeBot:
             self.logger.error(f"Failed to update status file: {e}")
 
     def log_trade_to_csv(self, exchange: str, side: str, price: str, quantity: str):
-        """Log trade details to CSV file."""
-        timestamp = datetime.now(pytz.UTC).isoformat()
-
-        with open(self.csv_filename, 'a', newline='') as csvfile:
-            writer = csv.writer(csvfile)
-            writer.writerow([
-                exchange,
-                timestamp,
-                side,
-                price,
-                quantity
-            ])
-
+        """Log trade details to CSV file using HedgeLogger."""
+        self.hedge_logger.log_trade(
+            exchange=exchange,
+            side=side,
+            price=float(price),
+            quantity=float(quantity)
+        )
         self.logger.info(f"📊 Trade logged to CSV: {exchange} {side} {quantity} @ {price}")
 
     def handle_lighter_order_result(self, order_data):
@@ -671,15 +608,41 @@ class HedgeBot:
         return (price / self.extended_tick_size).quantize(Decimal('1')) * self.extended_tick_size
 
     async def place_bbo_order(self, side: str, quantity: Decimal):
-        # Get best bid/ask prices
-        best_bid, best_ask = await self.fetch_extended_bbo_prices()
+        self.logger.info(f"place_bbo_order called: {side} {quantity}")
 
-        # Place the order using Extended client
-        order_result = await self.extended_client.place_open_order(
-            contract_id=self.extended_contract_id,
-            quantity=quantity,
-            direction=side.lower()
-        )
+        # Get best bid/ask prices with timeout
+        try:
+            self.logger.info(f"Fetching BBO prices...")
+            best_bid, best_ask = await asyncio.wait_for(
+                self.fetch_extended_bbo_prices(),
+                timeout=10.0
+            )
+            self.logger.info(f"BBO prices fetched: bid={best_bid}, ask={best_ask}")
+        except asyncio.TimeoutError:
+            self.logger.error(f"Timeout fetching BBO prices")
+            raise Exception("Timeout fetching BBO prices")
+        except Exception as e:
+            self.logger.error(f"Error fetching BBO prices: {e}")
+            raise
+
+        # Place the order using Extended client with timeout
+        try:
+            self.logger.info(f"Placing order: {side} {quantity} @ contract {self.extended_contract_id}")
+            order_result = await asyncio.wait_for(
+                self.extended_client.place_open_order(
+                    contract_id=self.extended_contract_id,
+                    quantity=quantity,
+                    direction=side.lower()
+                ),
+                timeout=10.0
+            )
+            self.logger.info(f"Order placement result: success={order_result.success}, order_id={order_result.order_id}")
+        except asyncio.TimeoutError:
+            self.logger.error(f"Timeout placing order")
+            raise Exception("Timeout placing order")
+        except Exception as e:
+            self.logger.error(f"Error placing order: {e}")
+            raise
 
         if order_result.success:
             return order_result.order_id, order_result.price
@@ -697,44 +660,72 @@ class HedgeBot:
 
         start_time = time.time()
         last_cancel_time = 0
-        
+        loop_count = 0
+
         while not self.stop_flag:
+            loop_count += 1
+            self.logger.info(f"Order loop iteration {loop_count}: status={self.extended_order_status}, stop_flag={self.stop_flag}, order_id={order_id}")
+
             if self.extended_order_status in ['CANCELED', 'CANCELLED']:
                 self.logger.info(f"Order {order_id} was canceled, placing new order")
+                self.logger.info(f"About to reset order status to None")
                 self.extended_order_status = None  # Reset to None to trigger new order
-                order_id, order_price = await self.place_bbo_order(side, quantity)
-                start_time = time.time()
-                last_cancel_time = 0  # Reset cancel timer
+                self.logger.info(f"Order status reset to None, entering try block")
+                try:
+                    self.logger.info(f"Calling place_bbo_order for {side} {quantity}")
+                    order_id, order_price = await self.place_bbo_order(side, quantity)
+                    self.logger.info(f"New order placed: {order_id} @ {order_price}")
+                    start_time = time.time()
+                    last_cancel_time = 0  # Reset cancel timer
+                except Exception as e:
+                    self.logger.error(f"❌ Failed to place new order after cancellation: {e}")
+                    import traceback
+                    self.logger.error(f"❌ Traceback: {traceback.format_exc()}")
+                    await asyncio.sleep(1)
+                    continue
                 await asyncio.sleep(0.5)
             elif self.extended_order_status in ['NEW', 'OPEN', 'PENDING', 'CANCELING', 'PARTIALLY_FILLED']:
                 await asyncio.sleep(0.5)
-                
+
                 # Check if we need to cancel and replace the order
                 should_cancel = False
                 if side == 'buy':
                     if order_price < self.extended_best_bid:
                         should_cancel = True
+                        self.logger.info(f"Order price {order_price} < best bid {self.extended_best_bid}, should cancel")
                 else:
                     if order_price > self.extended_best_ask:
                         should_cancel = True
+                        self.logger.info(f"Order price {order_price} > best ask {self.extended_best_ask}, should cancel")
 
                 # Cancel order if it's been too long or price is off
                 current_time = time.time()
-                if current_time - start_time > 10:
-                    if should_cancel and current_time - last_cancel_time > 5:  # Prevent rapid cancellations
+                time_elapsed = current_time - start_time
+
+                # Force cancel after 30 seconds regardless of price
+                force_cancel = time_elapsed > 30
+
+                if time_elapsed > 10:
+                    if (should_cancel or force_cancel) and current_time - last_cancel_time > 5:  # Prevent rapid cancellations
                         try:
-                            self.logger.info(f"Canceling order {order_id} due to timeout/price mismatch")
-                            cancel_result = await self.extended_client.cancel_order(order_id)
+                            reason = "price mismatch" if should_cancel else "force timeout (30s)"
+                            self.logger.info(f"Canceling order {order_id} due to {reason} (elapsed: {time_elapsed:.1f}s, order_price: {order_price}, best_bid: {self.extended_best_bid}, best_ask: {self.extended_best_ask})")
+                            cancel_result = await asyncio.wait_for(
+                                self.extended_client.cancel_order(order_id),
+                                timeout=10.0
+                            )
                             self.logger.info(f"cancel_result: {cancel_result}")
                             if cancel_result.success:
                                 last_cancel_time = current_time
                                 # Don't reset start_time here, let the cancellation trigger new order
                             else:
                                 self.logger.error(f"❌ Error canceling Extended order: {cancel_result.error_message}")
+                        except asyncio.TimeoutError:
+                            self.logger.error(f"❌ Timeout canceling Extended order {order_id}")
                         except Exception as e:
                             self.logger.error(f"❌ Error canceling Extended order: {e}")
-                    elif not should_cancel:
-                        self.logger.info(f"Waiting for Extended order to be filled (order price is at best bid/ask)")
+                    elif not should_cancel and not force_cancel:
+                        self.logger.info(f"Waiting for Extended order to be filled (elapsed: {time_elapsed:.1f}s, order_price: {order_price}, best_bid: {self.extended_best_bid}, best_ask: {self.extended_best_ask})")
             elif self.extended_order_status == 'FILLED':
                 self.logger.info(f"Order {order_id} filled successfully")
                 break
@@ -1243,11 +1234,6 @@ class HedgeBot:
                     self.logger.error("❌ Timeout waiting for trade completion")
                     break
 
-            # Sleep after step 2
-            if self.sleep_time > 0:
-                self.logger.info(f"💤 Sleeping {self.sleep_time} seconds after STEP 2...")
-                await asyncio.sleep(self.sleep_time)
-
             # Close remaining position
             self.logger.info(f"[STEP 3] Extended position: {self.extended_position} | Lighter position: {self.lighter_position}")
             self.order_execution_complete = False
@@ -1287,13 +1273,16 @@ class HedgeBot:
         """Run the hedge bot."""
         self.setup_signal_handlers()
 
+        # Start async logger
+        await self.hedge_logger.start()
+
         try:
             await self.trading_loop()
         except KeyboardInterrupt:
             self.logger.info("\n🛑 Received interrupt signal...")
         finally:
             self.logger.info("🔄 Cleaning up...")
-            self.shutdown()
+            await self.async_shutdown()
 
 
 def parse_arguments():
