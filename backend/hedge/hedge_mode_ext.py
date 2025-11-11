@@ -22,6 +22,7 @@ from datetime import datetime, timezone, timedelta
 
 # Import the unified hedge logger
 from helpers.logger import HedgeLogger
+from helpers.telegram_bot import TelegramBot
 
 
 class Config:
@@ -121,6 +122,11 @@ class HedgeBot:
         self.extended_stark_key_public = os.getenv('EXTENDED_STARK_KEY_PUBLIC')
         self.extended_api_key = os.getenv('EXTENDED_API_KEY')
 
+        # Telegram configuration
+        self.telegram_token = os.getenv('TELEGRAM_BOT_TOKEN')
+        self.telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID')
+        self.last_progress_notification = 0  # Track last progress percentage notified
+
     def shutdown(self, signum=None, frame=None):
         """Graceful shutdown handler."""
         self.stop_flag = True
@@ -149,6 +155,41 @@ class HedgeBot:
         """Async shutdown for logger only."""
         if hasattr(self, 'hedge_logger'):
             await self.hedge_logger.shutdown()
+
+    def send_telegram_notification(self, message: str):
+        """Send notification via Telegram."""
+        if not self.telegram_token or not self.telegram_chat_id:
+            return
+
+        try:
+            with TelegramBot(self.telegram_token, self.telegram_chat_id) as tg_bot:
+                tg_bot.send_text(message)
+        except Exception as e:
+            self.logger.error(f"Failed to send Telegram notification: {e}")
+
+    def check_and_notify_progress(self):
+        """Check progress and send notification every 5%."""
+        if self.iterations <= 0:
+            return
+
+        current_progress = int((self.current_iteration / self.iterations) * 100)
+
+        # Notify every 5%
+        progress_milestone = (current_progress // 5) * 5
+
+        if progress_milestone > self.last_progress_notification and progress_milestone % 5 == 0:
+            self.last_progress_notification = progress_milestone
+
+            message = (
+                f"🤖 <b>Hedge Bot Progress Update</b>\n\n"
+                f"Ticker: <code>{self.ticker}</code>\n"
+                f"Progress: <b>{progress_milestone}%</b> ({self.current_iteration}/{self.iterations})\n"
+                f"Extended Position: <code>{self.extended_position}</code>\n"
+                f"Lighter Position: <code>{self.lighter_position}</code>"
+            )
+
+            self.send_telegram_notification(message)
+            self.logger.info(f"📱 Progress notification sent: {progress_milestone}%")
 
     def update_status(self):
         """Update shared status file with current bot state."""
@@ -682,7 +723,6 @@ class HedgeBot:
 
         while not self.stop_flag:
             loop_count += 1
-            self.logger.info(f"Order loop iteration {loop_count}: status={self.extended_order_status}, stop_flag={self.stop_flag}, order_id={order_id}")
 
             if self.extended_order_status in ['CANCELED', 'CANCELLED']:
                 # Calculate how much has been filled so far in this session
@@ -1395,6 +1435,16 @@ class HedgeBot:
 
         await asyncio.sleep(5)
 
+        # Send start notification
+        start_msg = (
+            f"🚀 <b>Hedge Bot Started</b>\n\n"
+            f"Ticker: <code>{self.ticker}</code>\n"
+            f"Order Quantity: <code>{self.order_quantity}</code>\n"
+            f"Total Iterations: <b>{self.iterations}</b>\n"
+            f"Extended Contract: <code>{self.extended_contract_id}</code>\n"
+        )
+        self.send_telegram_notification(start_msg)
+
         iterations = 0
         while iterations < self.iterations and not self.stop_flag:
             iterations += 1
@@ -1424,6 +1474,15 @@ class HedgeBot:
 
                 self.logger.info(f"✅ [STEP 1] Extended order completed (Lighter hedges executed automatically)")
             except Exception as e:
+                error_msg = (
+                    f"❌ <b>Hedge Bot Error - STEP 1</b>\n\n"
+                    f"Ticker: <code>{self.ticker}</code>\n"
+                    f"Iteration: <b>{iterations}/{self.iterations}</b>\n"
+                    f"Error: <code>{str(e)}</code>\n\n"
+                    f"Extended Position: <code>{self.extended_position}</code>\n"
+                    f"Lighter Position: <code>{self.lighter_position}</code>"
+                )
+                self.send_telegram_notification(error_msg)
                 self.logger.error(f"⚠️ Error in trading loop: {e}")
                 self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
                 break
@@ -1456,6 +1515,18 @@ class HedgeBot:
                     self.logger.warning(f"⚠️ Attempt {attempt}: Still imbalanced (delta={delta})")
 
             if not is_balanced:
+                error_msg = (
+                    f"❌ <b>Hedge Bot Critical Error</b>\n\n"
+                    f"Ticker: <code>{self.ticker}</code>\n"
+                    f"Iteration: <b>{iterations}/{self.iterations}</b>\n\n"
+                    f"<b>Position Imbalance Detected!</b>\n"
+                    f"Extended: <code>{ext_pos}</code>\n"
+                    f"Lighter: <code>{ltr_pos}</code>\n"
+                    f"Delta: <code>{delta}</code>\n"
+                    f"Tolerance: <code>0.005</code>\n\n"
+                    f"⚠️ Trading terminated for safety"
+                )
+                self.send_telegram_notification(error_msg)
                 self.logger.error(f"❌ CRITICAL: Positions are imbalanced after STEP 1!")
                 self.logger.error(f"❌ Extended: {ext_pos}, Lighter: {ltr_pos}, Delta: {delta}")
                 self.logger.error(f"❌ Expected balanced positions (delta ≤ 0.005)")
@@ -1463,6 +1534,10 @@ class HedgeBot:
                 raise Exception(f"Position imbalance detected: delta={delta}, exceeds tolerance=0.005")
 
             self.logger.info("=" * 60)
+
+            # Send progress notification after successful position verification
+            # Position data here is most accurate after balance check
+            self.check_and_notify_progress()
 
             # Sleep after step 1
             if self.sleep_time > 0:
@@ -1481,6 +1556,15 @@ class HedgeBot:
 
                 self.logger.info(f"✅ [STEP 2] Extended order completed (Lighter hedges executed automatically)")
             except Exception as e:
+                error_msg = (
+                    f"❌ <b>Hedge Bot Error - STEP 2</b>\n\n"
+                    f"Ticker: <code>{self.ticker}</code>\n"
+                    f"Iteration: <b>{iterations}/{self.iterations}</b>\n"
+                    f"Error: <code>{str(e)}</code>\n\n"
+                    f"Extended Position: <code>{self.extended_position}</code>\n"
+                    f"Lighter Position: <code>{self.lighter_position}</code>"
+                )
+                self.send_telegram_notification(error_msg)
                 self.logger.error(f"⚠️ Error in trading loop: {e}")
                 self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
                 break
@@ -1504,9 +1588,30 @@ class HedgeBot:
 
                 self.logger.info(f"✅ [STEP 3] Remaining position closed (Lighter hedges executed automatically)")
             except Exception as e:
+                error_msg = (
+                    f"❌ <b>Hedge Bot Error - STEP 3</b>\n\n"
+                    f"Ticker: <code>{self.ticker}</code>\n"
+                    f"Iteration: <b>{iterations}/{self.iterations}</b>\n"
+                    f"Error: <code>{str(e)}</code>\n\n"
+                    f"Extended Position: <code>{self.extended_position}</code>\n"
+                    f"Lighter Position: <code>{self.lighter_position}</code>"
+                )
+                self.send_telegram_notification(error_msg)
                 self.logger.error(f"⚠️ Error in trading loop: {e}")
                 self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
                 break
+
+        # Send completion notification if loop finished successfully
+        if iterations >= self.iterations:
+            completion_msg = (
+                f"✅ <b>Hedge Bot Completed</b>\n\n"
+                f"Ticker: <code>{self.ticker}</code>\n"
+                f"Completed: <b>{iterations}/{self.iterations}</b> iterations\n"
+                f"Final Extended Position: <code>{self.extended_position}</code>\n"
+                f"Final Lighter Position: <code>{self.lighter_position}</code>\n\n"
+                f"🎉 All iterations finished successfully!"
+            )
+            self.send_telegram_notification(completion_msg)
 
     async def run(self):
         """Run the hedge bot."""
@@ -1521,6 +1626,50 @@ class HedgeBot:
             self.logger.info("\n🛑 Received interrupt signal...")
         finally:
             self.logger.info("🔄 Cleaning up...")
+
+            # Send final notification with current position info
+            try:
+                # Fetch final positions from both exchanges
+                final_extended_pos = Decimal('0')
+                final_lighter_pos = Decimal('0')
+
+                if self.extended_client:
+                    try:
+                        final_extended_pos = await self.extended_client.get_account_positions()
+                    except Exception as e:
+                        self.logger.error(f"Failed to get final Extended position: {e}")
+
+                if self.lighter_client:
+                    try:
+                        final_lighter_pos = await self.get_lighter_position()
+                    except Exception as e:
+                        self.logger.error(f"Failed to get final Lighter position: {e}")
+
+                # Calculate runtime
+                runtime = datetime.now() - self.start_time
+                runtime_str = str(runtime).split('.')[0]  # Remove microseconds
+
+                # Calculate completion percentage
+                completion_pct = int((self.current_iteration / self.iterations * 100)) if self.iterations > 0 else 0
+
+                # Send final notification
+                final_msg = (
+                    f"🏁 <b>Hedge Bot Shutdown</b>\n\n"
+                    f"Ticker: <code>{self.ticker}</code>\n"
+                    f"Completed: <b>{self.current_iteration}/{self.iterations}</b> ({completion_pct}%)\n"
+                    f"Runtime: <code>{runtime_str}</code>\n\n"
+                    f"<b>Final Positions:</b>\n"
+                    f"Extended: <code>{final_extended_pos}</code>\n"
+                    f"Lighter: <code>{final_lighter_pos}</code>\n"
+                    f"Delta: <code>{final_extended_pos + final_lighter_pos}</code>"
+                )
+
+                self.send_telegram_notification(final_msg)
+                self.logger.info("📱 Final shutdown notification sent")
+
+            except Exception as e:
+                self.logger.error(f"Failed to send final notification: {e}")
+
             await self.async_shutdown()
 
 
