@@ -11,7 +11,6 @@ from decimal import Decimal
 from typing import Tuple
 
 from lighter.signer_client import SignerClient
-import lighter  # For AccountApi to fetch positions
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -63,8 +62,6 @@ class HedgeBot:
         self.extended_contract_id = None
         self.extended_tick_size = None
         self.extended_order_status = None
-        self.current_extended_order_id = None  # Track current order ID
-        self.extended_order_hedged_size = Decimal('0')  # Track hedged size for current order
 
         # Extended order book state for websocket-based BBO
         self.extended_order_book = {'bids': {}, 'asks': {}}
@@ -82,9 +79,6 @@ class HedgeBot:
         self.lighter_order_book_sequence_gap = False
         self.lighter_snapshot_loaded = False
         self.lighter_order_book_lock = asyncio.Lock()
-        self.lighter_order_lock = asyncio.Lock()  # Lock for sequential order placement to prevent nonce conflicts
-        self.lighter_pending_hedge_size = Decimal('0')  # Accumulate small hedge amounts that are below min order size
-        self.lighter_min_order_size = None  # Will be loaded from market config
 
         # Lighter WebSocket state
         self.lighter_ws_task = None
@@ -520,10 +514,6 @@ class HedgeBot:
             if err is not None:
                 raise Exception(f"CheckClient error: {err}")
 
-            # Initialize API client for position queries
-            configuration = lighter.Configuration(host=self.lighter_base_url)
-            self.lighter_api_client = lighter.ApiClient(configuration)
-
             self.logger.info("✅ Lighter client initialized successfully")
         return self.lighter_client
 
@@ -550,7 +540,7 @@ class HedgeBot:
         self.logger.info("✅ Extended client initialized successfully")
         return self.extended_client
 
-    def get_lighter_market_config(self) -> Tuple[int, int, int, Decimal, Decimal]:
+    def get_lighter_market_config(self) -> Tuple[int, int, int, Decimal]:
         """Get Lighter market configuration."""
         url = f"{self.lighter_base_url}/api/v1/orderBooks"
         headers = {"accept": "application/json"}
@@ -570,12 +560,10 @@ class HedgeBot:
             for market in data["order_books"]:
                 if market["symbol"] == self.ticker:
                     price_multiplier = pow(10, market["supported_price_decimals"])
-                    min_base_amount = Decimal(market.get("min_base_amount", "0"))
-                    return (market["market_id"],
+                    return (market["market_id"], 
                            pow(10, market["supported_size_decimals"]),  # size multiplier
                            price_multiplier,  # price multiplier
-                           Decimal("1") / (Decimal("10") ** market["supported_price_decimals"]), # price step/ ticker size
-                           min_base_amount  # minimum order size
+                           Decimal("1") / (Decimal("10") ** market["supported_price_decimals"]) # price step/ ticker size
                            )
 
             raise Exception(f"Ticker {self.ticker} not found")
@@ -666,15 +654,9 @@ class HedgeBot:
         if not self.extended_client:
             raise Exception("Extended client not initialized")
 
-        # Track target quantity and filled quantity for this order session
-        target_quantity = quantity
-        session_start_position = self.extended_position  # Record starting position
-
         self.extended_order_status = None
-        self.logger.info(f"[OPEN] [Extended] [{side}] Placing Extended POST-ONLY order for {target_quantity}")
-        self.logger.info(f"Session start - Target: {target_quantity}, Starting position: {session_start_position}")
-
-        order_id, order_price = await self.place_bbo_order(side, target_quantity)
+        self.logger.info(f"[OPEN] [Extended] [{side}] Placing Extended POST-ONLY order")
+        order_id, order_price = await self.place_bbo_order(side, quantity)
 
         start_time = time.time()
         last_cancel_time = 0
@@ -685,32 +667,15 @@ class HedgeBot:
             self.logger.info(f"Order loop iteration {loop_count}: status={self.extended_order_status}, stop_flag={self.stop_flag}, order_id={order_id}")
 
             if self.extended_order_status in ['CANCELED', 'CANCELLED']:
-                # Calculate how much has been filled so far in this session
-                position_change = self.extended_position - session_start_position
-                if side == 'buy':
-                    filled_so_far = position_change  # Positive for buy
-                else:
-                    filled_so_far = -position_change  # Position decreases on sell, so negate
-
-                remaining_quantity = target_quantity - filled_so_far
-
-                self.logger.info(f"Order {order_id} was canceled")
-                self.logger.info(f"📊 Session tracking:")
-                self.logger.info(f"   Target quantity:    {target_quantity}")
-                self.logger.info(f"   Filled so far:      {filled_so_far}")
-                self.logger.info(f"   Remaining quantity: {remaining_quantity}")
-                self.logger.info(f"   Current position:   {self.extended_position} (started at {session_start_position})")
-
-                # Check if we've already filled enough
-                if remaining_quantity <= Decimal('0.001'):
-                    self.logger.info(f"✅ Target quantity already filled via partial fills, no need to place new order")
-                    break
-
+                self.logger.info(f"Order {order_id} was canceled, placing new order")
+                self.logger.info(f"About to reset order status to None")
                 self.extended_order_status = None  # Reset to None to trigger new order
+                self.logger.info(f"Order status reset to None, entering try block")
 
+                # 疑问：如果之前的订单已经部分成交了，又被取消了，重新下单下单的数量还是原来的数据，就会导致数量异常
                 try:
-                    self.logger.info(f"Placing new order for remaining quantity: {side} {remaining_quantity}")
-                    order_id, order_price = await self.place_bbo_order(side, remaining_quantity)
+                    self.logger.info(f"Calling place_bbo_order for {side} {quantity}")
+                    order_id, order_price = await self.place_bbo_order(side, quantity)
                     self.logger.info(f"New order placed: {order_id} @ {order_price}")
                     start_time = time.time()
                     last_cancel_time = 0  # Reset cancel timer
@@ -844,14 +809,10 @@ class HedgeBot:
             self.logger.error(f"Message content: {message}")
 
     def handle_extended_order_update(self, order_data):
-        """Handle Extended order updates from WebSocket - triggers immediate hedging."""
+        """Handle Extended order updates from WebSocket."""
         side = order_data.get('side', '').lower()
-        filled_size = Decimal(order_data.get('filled_size', '0'))  # This is incremental fill
+        filled_size = Decimal(order_data.get('filled_size', '0'))
         price = Decimal(order_data.get('price', '0'))
-
-        if filled_size <= 0:
-            self.logger.warning(f"⚠️ Ignoring order update with zero filled_size")
-            return
 
         # Determine Lighter side (opposite of Extended side)
         if side == 'buy':
@@ -859,196 +820,20 @@ class HedgeBot:
         else:
             lighter_side = 'buy'
 
-        self.logger.info(f"📋 Extended filled {filled_size}, triggering immediate Lighter hedge: {lighter_side} {filled_size} @ {price}")
+        # Store order details for immediate execution
+        self.current_lighter_side = lighter_side
+        self.current_lighter_quantity = filled_size
+        self.current_lighter_price = price
 
-        # Create async task to place Lighter order immediately (non-blocking)
-        asyncio.create_task(self._execute_lighter_hedge(lighter_side, filled_size, price))
+        self.lighter_order_info = {
+            'lighter_side': lighter_side,
+            'quantity': filled_size,
+            'price': price
+        }
 
-    async def _execute_lighter_hedge(self, lighter_side: str, quantity: Decimal, extended_price: Decimal):
-        """Execute Lighter hedge order immediately (runs as independent task)."""
-        try:
-            self.logger.info(f"🔄 Starting Lighter hedge: {lighter_side} {quantity}")
+        self.waiting_for_lighter_fill = True
 
-            if not self.lighter_client:
-                await self.initialize_lighter_client()
-
-            # Use lock to ensure orders are sent sequentially to prevent nonce conflicts
-            async with self.lighter_order_lock:
-                # Calculate actual quantity considering pending hedge
-                # pending_hedge_size: positive for buy, negative for sell
-                if lighter_side.lower() == 'buy':
-                    # For buy orders, add positive pending (subtract negative pending)
-                    actual_quantity = quantity + self.lighter_pending_hedge_size
-                else:
-                    # For sell orders, subtract positive pending (add negative pending)
-                    actual_quantity = quantity - self.lighter_pending_hedge_size
-
-                # Check if quantity meets minimum order size
-                if actual_quantity < self.lighter_min_order_size:
-                    # Store as pending with correct sign
-                    if lighter_side.lower() == 'buy':
-                        self.lighter_pending_hedge_size += quantity
-                    else:
-                        self.lighter_pending_hedge_size -= quantity
-
-                    self.logger.warning(f"⚠️ Hedge {lighter_side} {quantity} is below min {self.lighter_min_order_size}, "
-                                      f"pending hedge now: {self.lighter_pending_hedge_size} "
-                                      f"(will merge with opposite side)")
-                    return
-
-                # Log pending merge if exists
-                pending_to_clear = self.lighter_pending_hedge_size
-                if pending_to_clear != 0:
-                    self.logger.info(f"📊 Merging pending hedge {pending_to_clear} with {lighter_side} {quantity} = {actual_quantity}")
-
-                # Get current best levels
-                best_bid, best_ask = self.get_lighter_best_levels()
-
-                # Determine order parameters - use aggressive pricing for quick fill
-                if lighter_side.lower() == 'buy':
-                    is_ask = False
-                    price = best_ask[0] * Decimal('1.005')  # 0.5% above ask for quick fill
-                else:
-                    is_ask = True
-                    price = best_bid[0] * Decimal('0.995')  # 0.5% below bid for quick fill
-
-                self.logger.info(f"🎯 Lighter hedge order: {lighter_side} {actual_quantity} @ {price} (Extended filled @ {extended_price})")
-
-                # Place the order
-                # Use milliseconds (not microseconds) to stay within Lighter's limit of 281474976710655
-                client_order_index = int(time.time() * 1000)
-
-                tx_info, error = self.lighter_client.sign_create_order(
-                    market_index=self.lighter_market_index,
-                    client_order_index=client_order_index,
-                    base_amount=int(actual_quantity * self.base_amount_multiplier),
-                    price=int(price * self.price_multiplier),
-                    is_ask=is_ask,
-                    order_type=self.lighter_client.ORDER_TYPE_LIMIT,
-                    time_in_force=self.lighter_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
-                    reduce_only=False,
-                    trigger_price=0,
-                )
-
-                if error is not None:
-                    raise Exception(f"Sign error: {error}")
-
-                tx_hash = await self.lighter_client.send_tx(
-                    tx_type=self.lighter_client.TX_TYPE_CREATE_ORDER,
-                    tx_info=tx_info
-                )
-
-                self.logger.info(f"✅ Lighter hedge order placed: {lighter_side} {actual_quantity} @ {price}, tx_hash: {tx_hash}")
-
-                # Clear pending only after successful order placement
-                self.lighter_pending_hedge_size = Decimal('0')
-
-                # Small delay to ensure nonce is updated on server before next order
-                await asyncio.sleep(0.1)
-
-                # Store actual_quantity for monitoring
-                placed_quantity = actual_quantity
-
-            # Monitor the order (with timeout) - outside lock so monitoring can happen in parallel
-            await self._monitor_lighter_hedge(client_order_index, placed_quantity, lighter_side, timeout=30)
-
-        except Exception as e:
-            self.logger.error(f"❌ Error executing Lighter hedge: {e}")
-            self.logger.error(f"❌ Traceback: {traceback.format_exc()}")
-
-    async def _monitor_lighter_hedge(self, client_order_index: int, expected_quantity: Decimal, side: str, timeout: int = 30):
-        """Monitor a specific Lighter hedge order."""
-        self.logger.info(f"🔍 Monitoring Lighter hedge order {client_order_index}")
-        start_time = time.time()
-
-        # TODO: Implement proper order monitoring via WebSocket
-        # For now, just wait with timeout
-        await asyncio.sleep(1)  # Give it time to fill
-
-        elapsed = time.time() - start_time
-        if elapsed > timeout:
-            self.logger.warning(f"⚠️ Lighter hedge order {client_order_index} monitoring timeout after {elapsed:.1f}s")
-        else:
-            self.logger.info(f"✅ Lighter hedge order {client_order_index} completed in {elapsed:.1f}s")
-
-    async def get_lighter_position(self) -> Decimal:
-        """Get Lighter account position for the current market."""
-        try:
-            # Use AccountApi to fetch positions
-            account_api = lighter.AccountApi(self.lighter_api_client)
-            account_data = await account_api.account(by="index", value=str(self.account_index))
-
-            if not account_data or not account_data.accounts:
-                self.logger.warning("⚠️ Failed to get Lighter account data")
-                return Decimal('0')
-
-            # Get positions from first account
-            positions = account_data.accounts[0].positions
-
-            # Find position for current market
-            for position in positions:
-                if position.market_id == self.lighter_market_index:
-                    # position.sign: 1 for Long, -1 for Short
-                    # position.position: absolute value of position size
-                    position_size = Decimal(position.position)
-                    position_sign = int(position.sign)
-
-                    # Calculate signed position: positive for long, negative for short
-                    signed_position = position_size * position_sign
-
-                    self.logger.info(f"📊 Lighter position: size={position_size}, sign={position_sign}, signed={signed_position}")
-                    return signed_position
-
-            # No position found for this market
-            return Decimal('0')
-
-        except Exception as e:
-            self.logger.error(f"❌ Error fetching Lighter position: {e}")
-            return Decimal('0')
-
-    async def verify_positions_balanced(self, tolerance: Decimal = Decimal('0.001')) -> Tuple[bool, Decimal, Decimal, Decimal]:
-        """
-        Verify that positions are balanced across both exchanges.
-
-        Returns:
-            Tuple of (is_balanced, extended_position, lighter_position, delta)
-        """
-        self.logger.info("🔍 Verifying position balance across exchanges...")
-
-        try:
-            # Fetch real positions from both exchanges
-            extended_real_position = await self.extended_client.get_account_positions()
-            lighter_real_position = await self.get_lighter_position()
-
-            # Calculate delta
-            delta = extended_real_position + lighter_real_position
-
-            self.logger.info(
-                f"📊 Position Check:\n"
-                f"   Extended (real): {extended_real_position}\n"
-                f"   Lighter (real):  {lighter_real_position}\n"
-                f"   Delta:           {delta}\n"
-                f"   Local tracking - Extended: {self.extended_position}, Lighter: {self.lighter_position}"
-            )
-
-            # Check if balanced (within tolerance)
-            is_balanced = abs(delta) <= tolerance
-
-            if is_balanced:
-                self.logger.info(f"✅ Positions are balanced (delta: {delta} within tolerance: {tolerance})")
-            else:
-                self.logger.warning(f"⚠️ Positions are IMBALANCED! Delta: {delta} exceeds tolerance: {tolerance}")
-
-            # Update local tracking with real positions
-            self.extended_position = extended_real_position
-            self.lighter_position = lighter_real_position
-
-            return is_balanced, extended_real_position, lighter_real_position, delta
-
-        except Exception as e:
-            self.logger.error(f"❌ Error verifying positions: {e}")
-            self.logger.error(f"❌ Traceback: {traceback.format_exc()}")
-            return False, Decimal('0'), Decimal('0'), Decimal('0')
+        self.logger.info(f"📋 Ready to place Lighter order: {lighter_side} {filled_size} @ {price}")
 
     async def place_lighter_market_order(self, lighter_side: str, quantity: Decimal, price: Decimal):
         if not self.lighter_client:
@@ -1172,7 +957,7 @@ class HedgeBot:
                 order_id = order_data.get('order_id')
                 status = order_data.get('status')
                 side = order_data.get('side', '').lower()
-                cumulative_filled = Decimal(order_data.get('filled_size', '0'))  # Cumulative filled from exchange
+                filled_size = Decimal(order_data.get('filled_size', '0'))
                 size = Decimal(order_data.get('size', '0'))
                 price = order_data.get('price', '0')
 
@@ -1181,39 +966,31 @@ class HedgeBot:
                 else:
                     order_type = "CLOSE"
 
-                # Calculate incremental fill for this update
-                if order_id != self.current_extended_order_id:
-                    # New order - reset tracking
-                    self.current_extended_order_id = order_id
-                    self.extended_order_hedged_size = Decimal('0')
-                    incremental_filled = cumulative_filled
-                    self.logger.info(f"🆕 New Extended order detected: {order_id}")
-                else:
-                    # Same order - calculate increment
-                    incremental_filled = cumulative_filled - self.extended_order_hedged_size
+                # Handle the order update
+                if status == 'FILLED':
 
-                # Handle fills (both PARTIALLY_FILLED and FILLED)
-                if incremental_filled > 0 and status in ['PARTIALLY_FILLED', 'FILLED']:
-                    # Update Extended position (only the increment)
+                    if (filled_size < size):
+                        self.logger.warning(f"Warning: Filled Size {filled_size} is less than Size {size} on FILLED status for order {order_id}")
+                        filled_size = size  # Ensure filled_size matches size on FILLED
+                    
                     if side == 'buy':
-                        self.extended_position += incremental_filled
+                        self.extended_position += filled_size
                     else:
-                        self.extended_position -= incremental_filled
+                        self.extended_position -= filled_size
 
-                    self.logger.info(
-                        f"[{order_id}] [{order_type}] [Extended] [{status}]: "
-                        f"Incremental Fill {incremental_filled} (Cumulative: {cumulative_filled}/{size}) @ {price}"
-                    )
+                    # 疑问: 这里如果是部分成交然后又成交完会不会有问题，Filled Size会小于 Size，这样订单的 position 就不对了？
 
-                    # Log Extended trade to CSV (incremental only)
+                    self.logger.info(f"[{order_id}] [{order_type}] [Extended] [{status}]: Filled Size {filled_size} @ {price}")
+                    self.extended_order_status = status
+
+                    # Log Extended trade to CSV
                     self.log_trade_to_csv(
                         exchange='Extended',
                         side=side,
                         price=str(price),
-                        quantity=str(incremental_filled)
+                        quantity=str(filled_size)
                     )
 
-                    # Trigger immediate Lighter hedge (incremental only)
                     self.handle_extended_order_update({
                         'order_id': order_id,
                         'side': side,
@@ -1221,33 +998,23 @@ class HedgeBot:
                         'size': size,
                         'price': price,
                         'contract_id': self.extended_contract_id,
-                        'filled_size': incremental_filled  # Pass incremental fill!
+                        'filled_size': filled_size
                     })
-
-                    # Update hedged size tracker
-                    self.extended_order_hedged_size = cumulative_filled
 
                     # Update status after position change
                     self.update_status()
-
-                # Update order status
-                if status == 'FILLED':
-                    self.extended_order_status = status
-                    self.logger.info(f"✅ Extended order {order_id} fully filled: {cumulative_filled}/{size}")
-                elif status == 'PARTIALLY_FILLED':
-                    self.extended_order_status = "OPEN"
-                elif status in ['CANCELED', 'CANCELLED']:
-                    self.extended_order_status = status
-                    if self.extended_order_hedged_size < cumulative_filled:
-                        self.logger.warning(
-                            f"⚠️ Order {order_id} cancelled with partial fill: "
-                            f"Filled {cumulative_filled}, Hedged {self.extended_order_hedged_size}"
-                        )
-                elif status in ['NEW', 'OPEN', 'PENDING', 'CANCELING']:
-                    self.extended_order_status = status
                 else:
-                    self.logger.warning(f"Unknown order status: {status}")
-                    self.extended_order_status = status
+                    # Update order status for all non-filled statuses
+                    self.logger.info(f"[{order_id}] [{order_type}] [Extended] [{status}]: Size {size} @ {price} (Filled: {filled_size})")
+                    if status == 'PARTIALLY_FILLED':
+                        self.extended_order_status = "OPEN"
+                    elif status in ['CANCELED', 'CANCELLED']:
+                        self.extended_order_status = status
+                    elif status in ['NEW', 'OPEN', 'PENDING', 'CANCELING']:
+                        self.extended_order_status = status
+                    else:
+                        self.logger.warning(f"Unknown order status: {status}")
+                        self.extended_order_status = status
 
             except Exception as e:
                 self.logger.error(f"Error handling Extended order update: {e}")
@@ -1335,10 +1102,10 @@ class HedgeBot:
 
             # Get contract info
             self.extended_contract_id, self.extended_tick_size = await self.get_extended_contract_info()
-            self.lighter_market_index, self.base_amount_multiplier, self.price_multiplier, self.tick_size, self.lighter_min_order_size = self.get_lighter_market_config()
+            self.lighter_market_index, self.base_amount_multiplier, self.price_multiplier, self.tick_size = self.get_lighter_market_config()
 
             self.logger.info(f"Contract info loaded - Extended: {self.extended_contract_id}, "
-                             f"Lighter: {self.lighter_market_index}, Min order size: {self.lighter_min_order_size}")
+                             f"Lighter: {self.lighter_market_index}")
 
         except Exception as e:
             self.logger.error(f"❌ Failed to initialize: {e}")
@@ -1413,56 +1180,36 @@ class HedgeBot:
                 self.logger.error(f"❌ Position diff is too large: {self.extended_position + self.lighter_position}")
                 break
 
+            self.order_execution_complete = False
+            self.waiting_for_lighter_fill = False
             try:
                 # Determine side based on some logic (for now, alternate)
                 # 对冲交易模式，第一个交易所都是买入方向，这里可以改为可以参数设置
                 side = 'buy'
-                self.logger.info(f"[STEP 1] Placing Extended {side} order for {self.order_quantity}")
-
-                # Place Extended order - hedging will happen automatically via WebSocket
                 await self.place_extended_post_only_order(side, self.order_quantity)
-
-                self.logger.info(f"✅ [STEP 1] Extended order completed (Lighter hedges executed automatically)")
             except Exception as e:
                 self.logger.error(f"⚠️ Error in trading loop: {e}")
                 self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
                 break
 
+            start_time = time.time()
+            while not self.order_execution_complete and not self.stop_flag:
+                # Check if Extended order filled and we need to place Lighter order
+                if self.waiting_for_lighter_fill:
+                    await self.place_lighter_market_order(
+                        self.current_lighter_side,
+                        self.current_lighter_quantity,
+                        self.current_lighter_price
+                    )
+                    break
+
+                await asyncio.sleep(0.01)
+                if time.time() - start_time > 180:
+                    self.logger.error("❌ Timeout waiting for trade completion")
+                    break
+
             if self.stop_flag:
                 break
-
-            # Wait and verify positions are balanced after STEP 1
-            self.logger.info("=" * 60)
-            self.logger.info("🔍 [POST-STEP 1 VERIFICATION] Checking position balance...")
-            self.logger.info("=" * 60)
-
-            # Retry position verification with delays to allow for settlement
-            max_retries = 3
-            retry_delay = 2  # seconds
-            is_balanced = False
-
-            for attempt in range(1, max_retries + 1):
-                self.logger.info(f"⏳ Verification attempt {attempt}/{max_retries}, waiting {retry_delay}s for settlement...")
-                await asyncio.sleep(retry_delay)
-
-                is_balanced, ext_pos, ltr_pos, delta = await self.verify_positions_balanced(
-                    tolerance=Decimal('0.005')  # Allow 0.005 tolerance
-                )
-
-                if is_balanced:
-                    self.logger.info(f"✅ Positions balanced on attempt {attempt}")
-                    break
-                else:
-                    self.logger.warning(f"⚠️ Attempt {attempt}: Still imbalanced (delta={delta})")
-
-            if not is_balanced:
-                self.logger.error(f"❌ CRITICAL: Positions are imbalanced after STEP 1!")
-                self.logger.error(f"❌ Extended: {ext_pos}, Lighter: {ltr_pos}, Delta: {delta}")
-                self.logger.error(f"❌ Expected balanced positions (delta ≤ 0.005)")
-                self.logger.error(f"❌ Terminating trading loop for safety")
-                raise Exception(f"Position imbalance detected: delta={delta}, exceeds tolerance=0.005")
-
-            self.logger.info("=" * 60)
 
             # Sleep after step 1
             if self.sleep_time > 0:
@@ -1471,25 +1218,38 @@ class HedgeBot:
 
             # Close position
             self.logger.info(f"[STEP 2] Extended position: {self.extended_position} | Lighter position: {self.lighter_position}")
+            self.order_execution_complete = False
+            self.waiting_for_lighter_fill = False
             try:
                 # Determine side based on some logic (for now, alternate)
                 side = 'sell'
-                self.logger.info(f"[STEP 2] Placing Extended {side} order for {self.order_quantity}")
-
-                # Place Extended order - hedging will happen automatically via WebSocket
                 await self.place_extended_post_only_order(side, self.order_quantity)
-
-                self.logger.info(f"✅ [STEP 2] Extended order completed (Lighter hedges executed automatically)")
             except Exception as e:
                 self.logger.error(f"⚠️ Error in trading loop: {e}")
                 self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
                 break
 
-            # Close remaining position (if any)
+            while not self.order_execution_complete and not self.stop_flag:
+                # Check if Extended order filled and we need to place Lighter order
+                if self.waiting_for_lighter_fill:
+                    await self.place_lighter_market_order(
+                        self.current_lighter_side,
+                        self.current_lighter_quantity,
+                        self.current_lighter_price
+                    )
+                    break
+
+                await asyncio.sleep(0.01)
+                if time.time() - start_time > 180:
+                    self.logger.error("❌ Timeout waiting for trade completion")
+                    break
+
+            # Close remaining position
             # 优化：第二步结束后，仓位应该为 0，用查询订单的方式去检查 position，如果有不为 0，则进行平仓操作
             self.logger.info(f"[STEP 3] Extended position: {self.extended_position} | Lighter position: {self.lighter_position}")
+            self.order_execution_complete = False
+            self.waiting_for_lighter_fill = False
             if self.extended_position == 0:
-                self.logger.info("✅ [STEP 3] No remaining position to close")
                 continue
             elif self.extended_position > 0:
                 side = 'sell'
@@ -1497,16 +1257,28 @@ class HedgeBot:
                 side = 'buy'
 
             try:
-                self.logger.info(f"[STEP 3] Closing remaining Extended position: {side} {abs(self.extended_position)}")
-
-                # Place Extended order - hedging will happen automatically via WebSocket
+                # Determine side based on some logic (for now, alternate)
                 await self.place_extended_post_only_order(side, abs(self.extended_position))
-
-                self.logger.info(f"✅ [STEP 3] Remaining position closed (Lighter hedges executed automatically)")
             except Exception as e:
                 self.logger.error(f"⚠️ Error in trading loop: {e}")
                 self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
                 break
+
+            # Wait for order to be filled via WebSocket
+            while not self.order_execution_complete and not self.stop_flag:
+                # Check if Extended order filled and we need to place Lighter order
+                if self.waiting_for_lighter_fill:
+                    await self.place_lighter_market_order(
+                        self.current_lighter_side,
+                        self.current_lighter_quantity,
+                        self.current_lighter_price
+                    )
+                    break
+
+                await asyncio.sleep(0.01)
+                if time.time() - start_time > 180:
+                    self.logger.error("❌ Timeout waiting for trade completion")
+                    break
 
     async def run(self):
         """Run the hedge bot."""
