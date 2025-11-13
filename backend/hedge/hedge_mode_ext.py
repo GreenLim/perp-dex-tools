@@ -746,6 +746,18 @@ class HedgeBot:
                     self.logger.info(f"✅ Target quantity already filled via partial fills, no need to place new order")
                     break
 
+                # Check if remaining quantity is below minimum order size
+                extended_min_size = getattr(self.extended_client, 'min_order_size', Decimal('0.01'))
+                if remaining_quantity < extended_min_size:
+                    self.logger.info(
+                        f"⚠️ Remaining quantity {remaining_quantity} is below minimum order size {extended_min_size}, "
+                        f"treating as filled. Session completed with {filled_so_far}/{target_quantity} filled."
+                    )
+                    self.logger.info(
+                        f"📊 Residual unfilled: {remaining_quantity} (will not be placed due to exchange minimum)"
+                    )
+                    break
+
                 self.extended_order_status = None  # Reset to None to trigger new order
 
                 try:
@@ -1575,16 +1587,32 @@ class HedgeBot:
             if self.extended_position == 0:
                 self.logger.info("✅ [STEP 3] No remaining position to close")
                 continue
-            elif self.extended_position > 0:
+
+            # Check if remaining position is below minimum order size
+            remaining_position = abs(self.extended_position)
+            extended_min_size = getattr(self.extended_client, 'min_order_size', Decimal('0.01'))  # Default to 0.01 if not set
+
+            if remaining_position < extended_min_size:
+                self.logger.info(
+                    f"⚠️ [STEP 3] Remaining position {remaining_position} is below minimum order size {extended_min_size}, "
+                    f"skipping close order. Position will be ignored."
+                )
+                self.logger.info(
+                    f"📊 Final residual - Extended: {self.extended_position}, Lighter: {self.lighter_position}, "
+                    f"Delta: {self.extended_position + self.lighter_position}"
+                )
+                continue
+
+            if self.extended_position > 0:
                 side = 'sell'
             else:
                 side = 'buy'
 
             try:
-                self.logger.info(f"[STEP 3] Closing remaining Extended position: {side} {abs(self.extended_position)}")
+                self.logger.info(f"[STEP 3] Closing remaining Extended position: {side} {remaining_position}")
 
                 # Place Extended order - hedging will happen automatically via WebSocket
-                await self.place_extended_post_only_order(side, abs(self.extended_position))
+                await self.place_extended_post_only_order(side, remaining_position)
 
                 self.logger.info(f"✅ [STEP 3] Remaining position closed (Lighter hedges executed automatically)")
             except Exception as e:

@@ -64,6 +64,17 @@ class HedgeModeRequest(BaseModel):
     fill_timeout: int = Field(5, ge=1, description="Timeout in seconds for maker order fills")
 
 
+class MomentumBotRequest(BaseModel):
+    exchange: ExchangeType = Field(..., description="Exchange to trade on (extended or lighter)")
+    ticker: str = Field(..., description="Trading pair ticker (e.g., ETH, BTC)")
+    quantity: float = Field(..., gt=0, description="Order size per trade")
+    direction: DirectionType = Field(..., description="Trade direction: buy or sell")
+    tick_offset: int = Field(..., gt=0, description="Number of ticks to offset from best price (e.g., 1 means 1 tick away)")
+    take_profit_pct: float = Field(..., gt=0, description="Take profit percentage (e.g., 0.02 for 0.02%)")
+    max_positions: int = Field(1, ge=1, description="Maximum concurrent positions")
+    wait_time: int = Field(5, ge=1, description="Wait time between cycles in seconds")
+
+
 class BotStatus(BaseModel):
     status: str
     message: str
@@ -233,6 +244,52 @@ async def run_hedge_mode(request: HedgeModeRequest):
     return BotStatus(
         status="started",
         message=f"Hedge mode task started: {' '.join(command)}",
+        timestamp=get_current_timestamp()
+    )
+
+
+@app.post("/momentum", response_model=BotStatus)
+async def run_momentum_bot(request: MomentumBotRequest):
+    """
+    Run momentum trading bot using run_momentum.py
+
+    Example:
+    ```
+    POST /momentum
+    {
+        "exchange": "extended",
+        "ticker": "ETH",
+        "quantity": 0.1,
+        "direction": "buy",
+        "tick_offset": 1,
+        "take_profit_pct": 0.02,
+        "max_positions": 1,
+        "wait_time": 5
+    }
+    ```
+    """
+    # Build command
+    command = [
+        "python3", "run_momentum.py",
+        "--exchange", request.exchange.value,
+        "--ticker", request.ticker,
+        "--quantity", str(request.quantity),
+        "--direction", request.direction.value,
+        "--tick-offset", str(request.tick_offset),
+        "--take-profit-pct", str(request.take_profit_pct),
+        "--max-positions", str(request.max_positions),
+        "--wait-time", str(request.wait_time)
+    ]
+
+    # Generate task ID
+    task_id = f"momentum_{request.exchange.value}_{request.ticker}_{get_current_timestamp()}"
+
+    # Run in background
+    run_command_background(command, task_id)
+
+    return BotStatus(
+        status="started",
+        message=f"Momentum bot task started: {' '.join(command)}",
         timestamp=get_current_timestamp()
     )
 
