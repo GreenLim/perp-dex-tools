@@ -1037,7 +1037,7 @@ class ExtendedClient(BaseExchangeClient):
                                 expire_time=expire_time,
                                 time_in_force=TimeInForce.GTT,
                                 reduce_only=False,
-                                post_only=False,
+                                post_only=True,  # Enable Post Only to ensure Maker execution
                                 starknet_domain=self.stark_config.starknet_domain,
                             )
 
@@ -1105,7 +1105,7 @@ class ExtendedClient(BaseExchangeClient):
                     size=quantity,
                     price=trigger_price,
                     status=order_info.status,
-                    has_embedded_tp=(HAS_SETTLEMENT_DATA and take_profit_price is not None)
+                    has_embedded_tp=False  # TP is disabled in this implementation (line 953), always place separately
                 )
             else:
                 return OrderResult(success=False, error_message=f'Unexpected order status: {order_info.status if order_info else "unknown"}')

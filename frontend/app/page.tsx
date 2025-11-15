@@ -151,23 +151,41 @@ export default function Home() {
   // 创建新任务
   const createNewTask = async (formData: any) => {
     try {
-      const endpoint = formData.type === 'hedge' ? '/hedge' : '/runbot';
-      const body = formData.type === 'hedge'
-        ? {
-            exchange: formData.exchange,
-            ticker: formData.ticker,
-            size: parseFloat(formData.size),
-            iter: parseInt(formData.iterations),
-            sleep: parseInt(formData.sleep),
-            fill_timeout: parseInt(formData.fillTimeout)
-          }
-        : {
-            exchange: formData.exchange,
-            ticker: formData.ticker,
-            direction: formData.direction,
-            quantity: parseFloat(formData.quantity),
-            boost: formData.boost
-          };
+      let endpoint = '/runbot';
+      let body: any = {};
+
+      if (formData.type === 'hedge') {
+        endpoint = '/hedge';
+        body = {
+          exchange: formData.exchange,
+          ticker: formData.ticker,
+          size: parseFloat(formData.size),
+          iter: parseInt(formData.iterations),
+          sleep: parseInt(formData.sleep),
+          fill_timeout: parseInt(formData.fillTimeout)
+        };
+      } else if (formData.type === 'momentum') {
+        endpoint = '/momentum';
+        body = {
+          exchange: formData.exchange,
+          ticker: formData.ticker,
+          quantity: parseFloat(formData.quantity),
+          direction: formData.direction,
+          tick_offset: parseInt(formData.tickOffset),
+          take_profit_pct: parseFloat(formData.takeProfitPct),
+          max_positions: parseInt(formData.maxPositions),
+          wait_time: parseInt(formData.waitTime)
+        };
+      } else {
+        // runbot
+        body = {
+          exchange: formData.exchange,
+          ticker: formData.ticker,
+          direction: formData.direction,
+          quantity: parseFloat(formData.quantity),
+          boost: formData.boost
+        };
+      }
 
       const response = await fetch(`http://localhost:8000${endpoint}`, {
         method: 'POST',

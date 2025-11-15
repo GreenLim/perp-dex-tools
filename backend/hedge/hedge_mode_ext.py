@@ -156,6 +156,33 @@ class HedgeBot:
         if hasattr(self, 'hedge_logger'):
             await self.hedge_logger.shutdown()
 
+    async def reconnect_lighter_websocket(self):
+        """Reconnect Lighter WebSocket by cancelling and restarting the task."""
+        try:
+            # Cancel existing WebSocket task
+            if self.lighter_ws_task and not self.lighter_ws_task.done():
+                self.logger.info("🔄 Cancelling Lighter WebSocket task for reconnection...")
+                self.lighter_ws_task.cancel()
+                try:
+                    await self.lighter_ws_task
+                except asyncio.CancelledError:
+                    pass
+
+            # Reset orderbook state
+            await self.reset_lighter_order_book()
+
+            # Restart WebSocket task
+            self.logger.info("🔄 Restarting Lighter WebSocket connection...")
+            self.lighter_ws_task = asyncio.create_task(self.handle_lighter_ws())
+
+            # Give it a moment to establish connection
+            await asyncio.sleep(1)
+
+            self.logger.info("✅ Lighter WebSocket reconnection initiated")
+        except Exception as e:
+            self.logger.error(f"❌ Error during Lighter WebSocket reconnection: {e}")
+            self.logger.error(f"Traceback: {traceback.format_exc()}")
+
     def send_telegram_notification(self, message: str):
         """Send notification via Telegram."""
         if not self.telegram_token or not self.telegram_chat_id:
@@ -956,11 +983,47 @@ class HedgeBot:
                 # Get current best levels
                 best_bid, best_ask = self.get_lighter_best_levels()
 
-                # Determine order parameters - use aggressive pricing for quick fill
+                # Check if orderbook data is available
                 if lighter_side.lower() == 'buy':
+                    if best_ask is None or len(best_ask) == 0:
+                        self.logger.error(f"❌ Cannot execute Lighter hedge: best_ask is None or empty (orderbook not ready)")
+                        self.logger.warning(f"🔄 Triggering Lighter WebSocket reconnection...")
+
+                        # Trigger WebSocket reconnection
+                        await self.reconnect_lighter_websocket()
+
+                        # Wait for orderbook to reload (max 10 seconds)
+                        for i in range(20):
+                            await asyncio.sleep(0.5)
+                            best_bid, best_ask = self.get_lighter_best_levels()
+                            if best_ask is not None and len(best_ask) > 0:
+                                self.logger.info(f"✅ Lighter orderbook restored after reconnection")
+                                break
+                        else:
+                            self.logger.error(f"❌ Lighter orderbook still not ready after reconnection, skipping hedge")
+                            return
+
                     is_ask = False
                     price = best_ask[0] * Decimal('1.005')  # 0.5% above ask for quick fill
                 else:
+                    if best_bid is None or len(best_bid) == 0:
+                        self.logger.error(f"❌ Cannot execute Lighter hedge: best_bid is None or empty (orderbook not ready)")
+                        self.logger.warning(f"🔄 Triggering Lighter WebSocket reconnection...")
+
+                        # Trigger WebSocket reconnection
+                        await self.reconnect_lighter_websocket()
+
+                        # Wait for orderbook to reload (max 10 seconds)
+                        for i in range(20):
+                            await asyncio.sleep(0.5)
+                            best_bid, best_ask = self.get_lighter_best_levels()
+                            if best_bid is not None and len(best_bid) > 0:
+                                self.logger.info(f"✅ Lighter orderbook restored after reconnection")
+                                break
+                        else:
+                            self.logger.error(f"❌ Lighter orderbook still not ready after reconnection, skipping hedge")
+                            return
+
                     is_ask = True
                     price = best_bid[0] * Decimal('0.995')  # 0.5% below bid for quick fill
 
@@ -1508,7 +1571,7 @@ class HedgeBot:
             self.logger.info("=" * 60)
 
             # Retry position verification with delays to allow for settlement
-            max_retries = 3
+            max_retries = 10
             retry_delay = 2  # seconds
             is_balanced = False
 

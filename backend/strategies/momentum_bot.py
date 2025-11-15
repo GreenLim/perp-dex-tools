@@ -47,8 +47,12 @@ class MomentumConfig:
     # Exit strategy (take-profit)
     take_profit_pct: Decimal        # Take profit percentage (e.g., 0.02 for 0.02%)
 
+    # Moving grid strategy
+    enable_grid: bool = True        # Enable moving grid (add positions when price moves against us)
+    grid_trigger_pct: Decimal = Decimal('0.05')  # Trigger new grid entry when price moves 0.05% against position
+
     # Trading controls
-    max_positions: int = 1          # Maximum concurrent positions
+    max_positions: int = 10         # Maximum concurrent grid positions
     wait_time: int = 5              # Wait time between checks (seconds)
 
     # Auto-filled fields (will be set during initialization)
@@ -62,23 +66,85 @@ class MomentumConfig:
 
 
 @dataclass
-class PositionState:
-    """Track current position state."""
-    entry_order_id: Optional[str] = None
-    entry_price: Optional[Decimal] = None
-    entry_quantity: Decimal = Decimal('0')
+class GridPosition:
+    """Track individual grid position."""
+    entry_order_id: str
+    entry_price: Decimal
+    entry_quantity: Decimal
     exit_order_id: Optional[str] = None
+    is_filled: bool = False
+    exit_filled: bool = False
+
+
+@dataclass
+class PositionState:
+    """Track all open grid positions."""
+    positions: list = None  # List of GridPosition
     is_position_open: bool = False
-    has_embedded_tp: bool = False  # True if entry order includes embedded TP
+    lowest_entry_price: Optional[Decimal] = None  # For long: track lowest entry
+    highest_entry_price: Optional[Decimal] = None  # For short: track highest entry
+
+    def __post_init__(self):
+        if self.positions is None:
+            self.positions = []
 
     def reset(self):
-        """Reset position state."""
-        self.entry_order_id = None
-        self.entry_price = None
-        self.entry_quantity = Decimal('0')
-        self.exit_order_id = None
+        """Reset all position state."""
+        self.positions = []
         self.is_position_open = False
-        self.has_embedded_tp = False
+        self.lowest_entry_price = None
+        self.highest_entry_price = None
+
+    def add_position(self, entry_order_id: str, entry_price: Decimal, entry_quantity: Decimal):
+        """Add a new grid position."""
+        grid_pos = GridPosition(
+            entry_order_id=entry_order_id,
+            entry_price=entry_price,
+            entry_quantity=entry_quantity
+        )
+        self.positions.append(grid_pos)
+        return grid_pos
+
+    def get_position_by_entry_order_id(self, order_id: str) -> Optional[GridPosition]:
+        """Find position by entry order ID."""
+        for pos in self.positions:
+            if pos.entry_order_id == order_id:
+                return pos
+        return None
+
+    def get_position_by_exit_order_id(self, order_id: str) -> Optional[GridPosition]:
+        """Find position by exit order ID."""
+        for pos in self.positions:
+            if pos.exit_order_id == order_id:
+                return pos
+        return None
+
+    def get_total_quantity(self) -> Decimal:
+        """Get total quantity across all filled positions."""
+        return sum(pos.entry_quantity for pos in self.positions if pos.is_filled and not pos.exit_filled)
+
+    def get_average_entry_price(self) -> Optional[Decimal]:
+        """Calculate weighted average entry price."""
+        filled_positions = [pos for pos in self.positions if pos.is_filled and not pos.exit_filled]
+        if not filled_positions:
+            return None
+
+        total_cost = sum(pos.entry_price * pos.entry_quantity for pos in filled_positions)
+        total_quantity = sum(pos.entry_quantity for pos in filled_positions)
+
+        if total_quantity == 0:
+            return None
+
+        return total_cost / total_quantity
+
+    def update_extreme_price(self, entry_price: Decimal, direction: str):
+        """Update lowest/highest entry price for grid tracking."""
+        if direction == "buy":
+            if self.lowest_entry_price is None or entry_price < self.lowest_entry_price:
+                self.lowest_entry_price = entry_price
+        else:  # sell
+            if self.highest_entry_price is None or entry_price > self.highest_entry_price:
+                self.highest_entry_price = entry_price
 
 
 class MomentumBot:
@@ -127,6 +193,11 @@ class MomentumBot:
         # Events for async coordination
         self.entry_filled_event = asyncio.Event()
         self.exit_filled_event = asyncio.Event()
+
+        # Entry order monitoring state (for current order being placed)
+        self.current_entry_order_id: Optional[str] = None
+        self.entry_order_status: Optional[str] = None
+        self.entry_order_price: Optional[Decimal] = None
 
         # Setup WebSocket handlers
         self._setup_websocket_handlers()
@@ -248,27 +319,63 @@ class MomentumBot:
                     "INFO"
                 )
 
-                # Handle entry order fill
-                if order_id == self.position.entry_order_id and status == 'FILLED':
-                    self.position.entry_price = price
-                    self.position.entry_quantity = filled_size
+                # Check if this is an entry order for current monitoring
+                if order_id == self.current_entry_order_id:
+                    self.entry_order_status = status
+
+                # Handle entry order fill - find the position
+                grid_pos = self.position.get_position_by_entry_order_id(order_id)
+                if grid_pos and status == 'FILLED':
+                    grid_pos.is_filled = True
+                    grid_pos.entry_price = price
+                    grid_pos.entry_quantity = filled_size
                     self.position.is_position_open = True
+
+                    # Update extreme price tracking
+                    self.position.update_extreme_price(price, self.config.direction)
 
                     # Signal entry filled
                     if self.loop is not None:
                         self.loop.call_soon_threadsafe(self.entry_filled_event.set)
 
-                    self.logger.log(f"✅ Entry order filled: {filled_size} @ {price}", "INFO")
+                    self.logger.log(f"✅ Grid entry filled: {filled_size} @ {price}", "INFO")
                     self.logger.log_transaction(order_id, side, filled_size, price, status)
 
+                    # Log current grid status
+                    total_qty = self.position.get_total_quantity()
+                    avg_price = self.position.get_average_entry_price()
+                    self.logger.log(
+                        f"📊 Grid status: {len([p for p in self.position.positions if p.is_filled and not p.exit_filled])} positions, "
+                        f"total qty={total_qty}, avg price={avg_price}",
+                        "INFO"
+                    )
+
                 # Handle exit order fill
-                elif order_id == self.position.exit_order_id and status == 'FILLED':
+                grid_pos = self.position.get_position_by_exit_order_id(order_id)
+                if grid_pos and status == 'FILLED':
+                    grid_pos.exit_filled = True
+
                     # Signal exit filled
                     if self.loop is not None:
                         self.loop.call_soon_threadsafe(self.exit_filled_event.set)
 
-                    self.logger.log(f"✅ Exit order filled: {filled_size} @ {price}", "INFO")
+                    self.logger.log(f"✅ Grid exit filled: {filled_size} @ {price}", "INFO")
                     self.logger.log_transaction(order_id, side, filled_size, price, status)
+
+                    # Log current grid status
+                    total_qty = self.position.get_total_quantity()
+                    avg_price = self.position.get_average_entry_price()
+                    remaining_positions = len([p for p in self.position.positions if p.is_filled and not p.exit_filled])
+                    self.logger.log(
+                        f"📊 Grid status: {remaining_positions} positions remaining, "
+                        f"total qty={total_qty}, avg price={avg_price}",
+                        "INFO"
+                    )
+
+                    # If all positions closed, reset
+                    if remaining_positions == 0:
+                        self.logger.log("✅ All grid positions closed, resetting...", "INFO")
+                        self.position.reset()
 
                 # Handle partial fills
                 elif status == 'PARTIALLY_FILLED':
@@ -320,112 +427,191 @@ class MomentumBot:
 
     async def place_entry_order(self) -> bool:
         """
-        Place conditional entry order with take profit.
+        Place conditional entry order with monitoring and re-placement logic.
 
         Flow:
         1. Get best price from market
         2. Calculate trigger price based on tick_offset
         3. Calculate take profit price
         4. Place conditional order with TP
+        5. Wait 5 seconds and check if filled
+        6. If not filled, check if price still optimal
+        7. If not optimal, cancel and re-place order
+
+        Returns:
+            bool: True if order placed successfully, False otherwise
+        """
+        max_retries = 10
+        retry_count = 0
+
+        while retry_count < max_retries:
+            try:
+                # Get current best price
+                best_price = await self.get_best_price()
+
+                # Calculate trigger price (entry price)
+                trigger_price, _ = self.calculate_entry_prices(best_price)
+
+                # Calculate take profit price
+                if self.config.direction == "buy":
+                    # For long: TP is above entry
+                    tp_price = trigger_price * (Decimal('1') + self.config.take_profit_pct / Decimal('100'))
+                else:
+                    # For short: TP is below entry
+                    tp_price = trigger_price * (Decimal('1') - self.config.take_profit_pct / Decimal('100'))
+
+                tp_price = self.exchange_client.round_to_tick(tp_price)
+
+                self.logger.log(
+                    f"📊 Placing {self.config.direction} conditional order (attempt {retry_count + 1}/{max_retries}): "
+                    f"trigger={trigger_price}, TP={tp_price}, qty={self.config.quantity}",
+                    "INFO"
+                )
+
+                # Reset events and state
+                self.entry_filled_event.clear()
+                self.entry_order_status = None
+                self.entry_order_price = trigger_price
+
+                # Place conditional order with take profit
+                if hasattr(self.exchange_client, 'place_conditional_order'):
+                    order_result = await self.exchange_client.place_conditional_order(
+                        self.config.contract_id,
+                        self.config.quantity,
+                        trigger_price,
+                        self.config.direction,
+                        take_profit_price=tp_price
+                    )
+                else:
+                    # Fallback to regular order
+                    self.logger.log("⚠️ Exchange doesn't support conditional orders, using regular order", "WARNING")
+                    order_result = await self.exchange_client.place_open_order(
+                        self.config.contract_id,
+                        self.config.quantity,
+                        self.config.direction
+                    )
+
+                if not order_result.success:
+                    self.logger.log(f"❌ Failed to place entry order: {order_result.error_message}", "ERROR")
+                    return False
+
+                # Add new grid position
+                grid_pos = self.position.add_position(
+                    entry_order_id=order_result.order_id,
+                    entry_price=trigger_price,
+                    entry_quantity=self.config.quantity
+                )
+
+                # Track for monitoring
+                self.current_entry_order_id = order_result.order_id
+
+                self.logger.log(
+                    f"✅ Entry order placed: {order_result.order_id} "
+                    f"(trigger={trigger_price}, TP={tp_price})",
+                    "INFO"
+                )
+
+                # Wait 5 seconds
+                self.logger.log("⏳ Waiting 5 seconds to check order status...", "INFO")
+                await asyncio.sleep(5)
+
+                # Check if order filled (via WebSocket update)
+                if self.entry_order_status == 'FILLED':
+                    self.logger.log(f"✅ Entry order filled within 5 seconds", "INFO")
+                    return True
+
+                # Order not filled, check if price still optimal
+                current_best_price = await self.get_best_price()
+                current_optimal_price, _ = self.calculate_entry_prices(current_best_price)
+
+                if self.entry_order_price != current_optimal_price:
+                    # Price changed, need to cancel and re-place
+                    self.logger.log(
+                        f"⚠️ Price changed: order trigger={self.entry_order_price}, "
+                        f"current optimal={current_optimal_price}. Cancelling and re-placing...",
+                        "WARNING"
+                    )
+
+                    # Cancel old order
+                    try:
+                        cancel_result = await self.exchange_client.cancel_order(self.current_entry_order_id)
+                        if cancel_result.success:
+                            self.logger.log(f"✅ Order {self.current_entry_order_id} cancelled", "INFO")
+
+                            # Remove the cancelled grid position from list
+                            self.position.positions = [
+                                pos for pos in self.position.positions
+                                if pos.entry_order_id != self.current_entry_order_id
+                            ]
+                        else:
+                            self.logger.log(f"⚠️ Failed to cancel order: {cancel_result.error_message}", "WARNING")
+
+                            # Check if order filled during cancellation
+                            await asyncio.sleep(0.5)
+                            if self.entry_order_status == 'FILLED':
+                                self.logger.log(f"✅ Order filled during cancellation attempt", "INFO")
+                                return True
+                    except Exception as e:
+                        self.logger.log(f"❌ Error cancelling order: {e}", "ERROR")
+
+                    # Reset state and retry
+                    self.current_entry_order_id = None
+                    self.entry_order_status = None
+                    self.entry_order_price = None
+                    retry_count += 1
+                    continue
+                else:
+                    # Price still optimal, continue waiting
+                    self.logger.log(
+                        f"✅ Order price still optimal ({self.entry_order_price}), continuing to wait...",
+                        "INFO"
+                    )
+
+                    # Wait another 5 seconds
+                    await asyncio.sleep(5)
+
+                    # Check again if filled
+                    if self.entry_order_status == 'FILLED':
+                        self.logger.log(f"✅ Entry order filled", "INFO")
+                        return True
+
+                    # Still not filled, retry
+                    retry_count += 1
+
+            except Exception as e:
+                self.logger.log(f"❌ Error placing entry order: {e}", "ERROR")
+                self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
+                retry_count += 1
+                await asyncio.sleep(2)
+
+        # Max retries reached
+        self.logger.log(f"❌ Failed to fill entry order after {max_retries} attempts", "ERROR")
+        return False
+
+    async def place_exit_order(self, grid_pos: GridPosition) -> bool:
+        """
+        Place take-profit order for a specific grid position.
+
+        Args:
+            grid_pos: The grid position to place TP order for
 
         Returns:
             bool: True if order placed successfully, False otherwise
         """
         try:
-            # Get current best price
-            best_price = await self.get_best_price()
-
-            # Calculate trigger price (entry price)
-            trigger_price, _ = self.calculate_entry_prices(best_price)
-
-            # Calculate take profit price
-            if self.config.direction == "buy":
-                # For long: TP is above entry
-                tp_price = trigger_price * (Decimal('1') + self.config.take_profit_pct / Decimal('100'))
-            else:
-                # For short: TP is below entry
-                tp_price = trigger_price * (Decimal('1') - self.config.take_profit_pct / Decimal('100'))
-
-            tp_price = self.exchange_client.round_to_tick(tp_price)
-
-            self.logger.log(
-                f"📊 Placing {self.config.direction} conditional order: "
-                f"trigger={trigger_price}, TP={tp_price}, qty={self.config.quantity}",
-                "INFO"
-            )
-
-            # Reset events
-            self.entry_filled_event.clear()
-
-            # Place conditional order with take profit
-            # Check if exchange client supports conditional orders
-            if hasattr(self.exchange_client, 'place_conditional_order'):
-                order_result = await self.exchange_client.place_conditional_order(
-                    self.config.contract_id,
-                    self.config.quantity,
-                    trigger_price,
-                    self.config.direction,
-                    take_profit_price=tp_price
-                )
-            else:
-                # Fallback to regular order
-                self.logger.log("⚠️ Exchange doesn't support conditional orders, using regular order", "WARNING")
-                order_result = await self.exchange_client.place_open_order(
-                    self.config.contract_id,
-                    self.config.quantity,
-                    self.config.direction
-                )
-
-            if not order_result.success:
-                self.logger.log(f"❌ Failed to place entry order: {order_result.error_message}", "ERROR")
-                return False
-
-            self.position.entry_order_id = order_result.order_id
-            # Store the expected entry price for TP calculation
-            self.position.entry_price = trigger_price
-            # Store whether TP was embedded in the entry order
-            self.position.has_embedded_tp = order_result.has_embedded_tp
-
-            self.logger.log(
-                f"✅ Entry order placed: {order_result.order_id} "
-                f"(trigger={trigger_price}, TP={tp_price}, embedded_tp={order_result.has_embedded_tp})",
-                "INFO"
-            )
-
-            return True
-
-        except Exception as e:
-            self.logger.log(f"❌ Error placing entry order: {e}", "ERROR")
-            self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
-            return False
-
-    async def place_exit_order(self) -> bool:
-        """
-        Place take-profit conditional order after entry fill.
-
-        Calculates take-profit price based on entry_price and take_profit_pct,
-        then places a conditional order that triggers when price reaches TP level.
-
-        Returns:
-            bool: True if order placed successfully, False otherwise
-        """
-        try:
-            # NOTE: Embedded TP is currently disabled, always place separate TP order
-            # if self.position.has_embedded_tp: ...
-
-            if not self.position.entry_price:
-                self.logger.log("❌ Cannot place exit order: no entry price", "ERROR")
+            if not grid_pos.is_filled:
+                self.logger.log(f"❌ Cannot place exit order: grid position not filled yet", "ERROR")
                 return False
 
             # Calculate take-profit price
             if self.config.direction == "buy":
                 # For long: sell at higher price (when price goes UP to TP)
-                exit_price = self.position.entry_price * (
+                exit_price = grid_pos.entry_price * (
                     Decimal('1') + self.config.take_profit_pct / Decimal('100')
                 )
             else:
                 # For short: buy at lower price (when price goes DOWN to TP)
-                exit_price = self.position.entry_price * (
+                exit_price = grid_pos.entry_price * (
                     Decimal('1') - self.config.take_profit_pct / Decimal('100')
                 )
 
@@ -434,18 +620,14 @@ class MomentumBot:
 
             self.logger.log(
                 f"📊 Placing {self.config.close_order_side} take-profit LIMIT order: "
-                f"price={exit_price}, qty={self.position.entry_quantity}",
+                f"price={exit_price}, qty={grid_pos.entry_quantity}",
                 "INFO"
             )
 
-            # Reset exit event
-            self.exit_filled_event.clear()
-
             # Use regular limit order for take-profit
-            # This is more reliable than embedded TP or conditional TP orders
             order_result = await self.exchange_client.place_close_order(
                 self.config.contract_id,
-                self.position.entry_quantity,
+                grid_pos.entry_quantity,
                 exit_price,
                 self.config.close_order_side
             )
@@ -454,17 +636,22 @@ class MomentumBot:
                 self.logger.log(f"❌ Failed to place exit order: {order_result.error_message}", "ERROR")
                 return False
 
-            self.position.exit_order_id = order_result.order_id
-            self.logger.log(f"✅ Exit order placed: {order_result.order_id}", "INFO")
+            grid_pos.exit_order_id = order_result.order_id
+            self.logger.log(f"✅ Exit order placed: {order_result.order_id} for entry {grid_pos.entry_order_id}", "INFO")
 
             # Send Telegram notification
+            total_qty = self.position.get_total_quantity()
+            avg_price = self.position.get_average_entry_price()
             trade_msg = (
-                f"🚀 <b>Momentum Bot - Position Opened</b>\n\n"
+                f"🚀 <b>Grid Bot - Position Opened</b>\n\n"
                 f"Ticker: <code>{self.config.ticker}</code>\n"
                 f"Direction: <b>{self.config.direction.upper()}</b>\n"
-                f"Entry Price: <code>{self.position.entry_price}</code>\n"
+                f"Entry Price: <code>{grid_pos.entry_price}</code>\n"
                 f"Exit Price: <code>{exit_price}</code>\n"
-                f"Quantity: <code>{self.position.entry_quantity}</code>\n"
+                f"Quantity: <code>{grid_pos.entry_quantity}</code>\n"
+                f"Total Positions: <b>{len([p for p in self.position.positions if p.is_filled and not p.exit_filled])}</b>\n"
+                f"Total Quantity: <code>{total_qty}</code>\n"
+                f"Average Price: <code>{avg_price}</code>\n"
                 f"Take Profit: <b>{self.config.take_profit_pct}%</b>"
             )
             self.send_telegram_notification(trade_msg)
@@ -476,63 +663,209 @@ class MomentumBot:
             self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
             return False
 
+    def has_pending_entry_order(self) -> bool:
+        """
+        Check if there's already a pending (unfilled) entry order.
+
+        Returns:
+            bool: True if there's a pending entry order
+        """
+        for pos in self.position.positions:
+            if not pos.is_filled:
+                return True
+        return False
+
+    async def cancel_pending_entry_orders(self) -> bool:
+        """
+        Cancel all pending (unfilled) entry orders.
+
+        Returns:
+            bool: True if all cancellations successful
+        """
+        pending_positions = [pos for pos in self.position.positions if not pos.is_filled]
+
+        if not pending_positions:
+            return True
+
+        all_success = True
+        for pos in pending_positions:
+            try:
+                self.logger.log(f"🚫 Cancelling pending entry order: {pos.entry_order_id}", "INFO")
+                cancel_result = await self.exchange_client.cancel_order(pos.entry_order_id)
+
+                if cancel_result.success:
+                    self.logger.log(f"✅ Order {pos.entry_order_id} cancelled", "INFO")
+                    # Remove from positions list
+                    self.position.positions = [
+                        p for p in self.position.positions
+                        if p.entry_order_id != pos.entry_order_id
+                    ]
+                else:
+                    self.logger.log(f"⚠️ Failed to cancel order {pos.entry_order_id}: {cancel_result.error_message}", "WARNING")
+                    all_success = False
+            except Exception as e:
+                self.logger.log(f"❌ Error cancelling order {pos.entry_order_id}: {e}", "ERROR")
+                all_success = False
+
+        return all_success
+
+    async def should_add_grid_position(self) -> bool:
+        """
+        Check if we should add a new grid position based on price movement.
+
+        For long: add position if price dropped 0.05% below lowest entry
+        For short: add position if price rose 0.05% above highest entry
+
+        CRITICAL: Also verify that the new entry price will be 0.05% better than
+        the current lowest/highest entry price, otherwise skip this opportunity.
+
+        Important: If grid trigger detected and there's a pending entry order,
+        cancel it first and place new order at better price.
+
+        Returns:
+            bool: True if should add new position
+        """
+        if not self.config.enable_grid:
+            return False
+
+        # Check if we've reached max positions
+        active_positions = len([p for p in self.position.positions if p.is_filled and not p.exit_filled])
+        if active_positions >= self.config.max_positions:
+            return False
+
+        # Get current best price
+        current_price = await self.get_best_price()
+
+        # Calculate what the new entry price would be
+        new_entry_price, _ = self.calculate_entry_prices(current_price)
+
+        # Check grid trigger condition
+        should_trigger = False
+
+        if self.config.direction == "buy":
+            # For long: check if price dropped below lowest entry
+            if self.position.lowest_entry_price is None:
+                should_trigger = True  # No positions yet, should enter
+            else:
+                # Calculate threshold: lowest_entry - 0.05%
+                threshold_price = self.position.lowest_entry_price * (
+                    Decimal('1') - self.config.grid_trigger_pct / Decimal('100')
+                )
+
+                # Check if current price triggers grid condition
+                if current_price <= threshold_price:
+                    # CRITICAL: Also verify new entry price is 0.05% lower than lowest entry
+                    required_entry_price = self.position.lowest_entry_price * (
+                        Decimal('1') - self.config.grid_trigger_pct / Decimal('100')
+                    )
+
+                    if new_entry_price <= required_entry_price:
+                        self.logger.log(
+                            f"📉 Grid trigger: price {current_price} <= threshold {threshold_price}, "
+                            f"new entry {new_entry_price} <= required {required_entry_price} "
+                            f"(lowest entry {self.position.lowest_entry_price} - {self.config.grid_trigger_pct}%)",
+                            "INFO"
+                        )
+                        should_trigger = True
+                    else:
+                        self.logger.log(
+                            f"⏸️ Grid trigger met but new entry price {new_entry_price} > required {required_entry_price}, skipping",
+                            "INFO"
+                        )
+        else:  # sell
+            # For short: check if price rose above highest entry
+            if self.position.highest_entry_price is None:
+                should_trigger = True  # No positions yet, should enter
+            else:
+                # Calculate threshold: highest_entry + 0.05%
+                threshold_price = self.position.highest_entry_price * (
+                    Decimal('1') + self.config.grid_trigger_pct / Decimal('100')
+                )
+
+                # Check if current price triggers grid condition
+                if current_price >= threshold_price:
+                    # CRITICAL: Also verify new entry price is 0.05% higher than highest entry
+                    required_entry_price = self.position.highest_entry_price * (
+                        Decimal('1') + self.config.grid_trigger_pct / Decimal('100')
+                    )
+
+                    if new_entry_price >= required_entry_price:
+                        self.logger.log(
+                            f"📈 Grid trigger: price {current_price} >= threshold {threshold_price}, "
+                            f"new entry {new_entry_price} >= required {required_entry_price} "
+                            f"(highest entry {self.position.highest_entry_price} + {self.config.grid_trigger_pct}%)",
+                            "INFO"
+                        )
+                        should_trigger = True
+                    else:
+                        self.logger.log(
+                            f"⏸️ Grid trigger met but new entry price {new_entry_price} < required {required_entry_price}, skipping",
+                            "INFO"
+                        )
+
+        # If grid triggered and there's a pending entry order, cancel it first
+        if should_trigger and self.has_pending_entry_order():
+            self.logger.log(
+                "⚠️ Grid trigger detected with pending entry order - cancelling old order to place new one at better price",
+                "WARNING"
+            )
+            await self.cancel_pending_entry_orders()
+
+        return should_trigger
+
     async def run_trading_cycle(self):
         """
-        Main trading cycle.
+        Main trading cycle with moving grid strategy.
 
         Flow:
-        1. Place entry stop-limit order
-        2. Wait for fill
-        3. Place take-profit order
-        4. Wait for fill
-        5. Reset and repeat
+        1. Check if should add new grid position
+        2. If yes, place entry order and wait for fill
+        3. Place take-profit order for filled position
+        4. Monitor price continuously for grid opportunities
+        5. Handle exit fills via WebSocket callback
         """
         try:
-            # Step 1: Place entry order
+            # Check if we should add a new grid position
+            if not await self.should_add_grid_position():
+                # No grid opportunity, just wait
+                await asyncio.sleep(self.config.wait_time)
+                return
+
+            # Place new grid entry order
+            self.logger.log(
+                f"📊 Grid opportunity detected, placing new entry order "
+                f"(current positions: {len([p for p in self.position.positions if p.is_filled and not p.exit_filled])})",
+                "INFO"
+            )
+
             if not await self.place_entry_order():
                 self.logger.log("⚠️ Failed to place entry order, retrying...", "WARN")
                 await asyncio.sleep(self.config.wait_time)
                 return
 
-            # Step 2: Wait for entry fill
-            self.logger.log("⏳ Waiting for entry order fill...", "INFO")
-            try:
-                await asyncio.wait_for(self.entry_filled_event.wait(), timeout=300)
-            except asyncio.TimeoutError:
-                self.logger.log("⏰ Entry order timeout, canceling...", "WARN")
-                if self.position.entry_order_id:
-                    await self.exchange_client.cancel_order(self.position.entry_order_id)
-                self.position.reset()
+            # Wait for entry fill (handled by place_entry_order's internal logic)
+            # The entry order is already filled when place_entry_order returns True
+
+            # Find the grid position we just added
+            if not self.current_entry_order_id:
+                self.logger.log("❌ No current entry order ID", "ERROR")
                 return
 
-            # Step 3: Place exit order
-            if not await self.place_exit_order():
-                self.logger.log("❌ Failed to place exit order", "ERROR")
-                # TODO: Handle error - may need to manually close position
-                self.position.reset()
+            grid_pos = self.position.get_position_by_entry_order_id(self.current_entry_order_id)
+            if not grid_pos:
+                self.logger.log(f"❌ Cannot find grid position for order {self.current_entry_order_id}", "ERROR")
                 return
 
-            # Step 4: Wait for exit fill
-            self.logger.log("⏳ Waiting for exit order fill...", "INFO")
-            try:
-                await asyncio.wait_for(self.exit_filled_event.wait(), timeout=3600)
-            except asyncio.TimeoutError:
-                self.logger.log("⏰ Exit order timeout", "WARN")
-                # Exit order will remain open on exchange
+            if not grid_pos.is_filled:
+                self.logger.log(f"⚠️ Grid position not filled yet, skipping TP placement", "WARN")
+                return
 
-            # Step 5: Reset position state
-            self.logger.log("✅ Trading cycle completed", "INFO")
+            # Place exit order for this position
+            if not await self.place_exit_order(grid_pos):
+                self.logger.log("❌ Failed to place exit order for grid position", "ERROR")
+                return
 
-            # Send completion notification
-            completion_msg = (
-                f"✅ <b>Momentum Bot - Position Closed</b>\n\n"
-                f"Ticker: <code>{self.config.ticker}</code>\n"
-                f"Entry: <code>{self.position.entry_price}</code>\n"
-                f"Quantity: <code>{self.position.entry_quantity}</code>"
-            )
-            self.send_telegram_notification(completion_msg)
-
-            self.position.reset()
+            self.logger.log(f"✅ Grid position cycle completed, continuing to monitor...", "INFO")
 
         except Exception as e:
             self.logger.log(f"❌ Error in trading cycle: {e}", "ERROR")
@@ -540,13 +873,11 @@ class MomentumBot:
 
             # Send error notification
             error_msg = (
-                f"❌ <b>Momentum Bot Error</b>\n\n"
+                f"❌ <b>Grid Bot Error</b>\n\n"
                 f"Ticker: <code>{self.config.ticker}</code>\n"
                 f"Error: {str(e)[:200]}"
             )
             self.send_telegram_notification(error_msg)
-
-            self.position.reset()
 
     async def run(self):
         """
@@ -573,14 +904,17 @@ class MomentumBot:
 
             # Send startup notification
             startup_msg = (
-                f"🤖 <b>Momentum Bot Started</b>\n\n"
+                f"🤖 <b>Moving Grid Bot Started</b>\n\n"
                 f"Exchange: <code>{self.config.exchange}</code>\n"
                 f"Ticker: <code>{self.config.ticker}</code>\n"
                 f"Contract ID: <code>{self.config.contract_id}</code>\n"
                 f"Direction: <b>{self.config.direction.upper()}</b>\n"
                 f"Quantity: <code>{self.config.quantity}</code>\n"
                 f"Tick Offset: <b>{self.config.tick_offset} ticks</b>\n"
-                f"Take Profit: <b>{self.config.take_profit_pct}%</b>"
+                f"Take Profit: <b>{self.config.take_profit_pct}%</b>\n"
+                f"Grid Enabled: <b>{self.config.enable_grid}</b>\n"
+                f"Grid Trigger: <b>{self.config.grid_trigger_pct}%</b>\n"
+                f"Max Positions: <b>{self.config.max_positions}</b>"
             )
             self.send_telegram_notification(startup_msg)
 
